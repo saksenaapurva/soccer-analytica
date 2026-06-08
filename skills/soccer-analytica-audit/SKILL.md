@@ -4,7 +4,7 @@ description: >
   Monthly Instagram Reels audit skill for the @soccer_analytica channel.
   Use this skill whenever the task is to update, refresh, or audit the Soccer Analytica dashboard —
   including scraping Instagram Insights for each reel, updating the SCRAPED data array,
-  updating the Cowork artifact (id: soccer-analytica), and pushing the updated dashboard to GitHub.
+  syncing data to Supabase, updating the Cowork artifact (id: soccer-analytica), and pushing to GitHub.
   Triggers on: "run monthly audit", "update soccer analytica dashboard", "scrape Instagram insights",
   "refresh the dashboard", or any scheduled task mentioning soccer_analytica.
   This skill is the single source of truth for how to reproduce the full data pipeline.
@@ -13,7 +13,7 @@ description: >
 # Soccer Analytica — Monthly Audit Skill
 
 This skill documents the complete workflow for scraping @soccer_analytica's Instagram Insights,
-updating the dashboard HTML, and pushing to GitHub. Follow every step in order.
+updating the dashboard HTML, syncing to Supabase, and pushing to GitHub. Follow every step in order.
 
 ---
 
@@ -27,6 +27,9 @@ updating the dashboard HTML, and pushing to GitHub. Follow every step in order.
   - If that path doesn't exist, search for `soccer-analytica.html` in the user's home directory
 - **GitHub username**: `saksenaapurva`
 - **GitHub repo**: `soccer-analytica` (private repo, branch: `main`)
+- **Supabase project ID**: `byxiutawntkirnwtbpju`
+- **Supabase table**: `reels`
+- **Supabase org**: `clinical-notes` (org ID: `reiygesdkdcmkzvuklqa`)
 
 ---
 
@@ -88,9 +91,11 @@ For each reel shortcode, follow this exact sequence:
 
 ### 4a. Navigate to the reel
 ```
-navigate to: https://www.instagram.com/reel/{SHORTCODE}/
+navigate to: https://www.instagram.com/p/{SHORTCODE}/
 ```
 Wait 2 seconds for the page to fully render.
+
+**IMPORTANT**: Use `/p/{SHORTCODE}/` — NOT `/reel/{SHORTCODE}/`. The "View insights" button only appears on the `/p/` URL format.
 
 ### 4b. Click "View insights"
 Use JavaScript — do NOT try to click by coordinate or ref, as the button is a `div[role="button"]`:
@@ -229,7 +234,53 @@ Keep each analysis to 2–4 sentences. Base it on the actual metrics scraped —
 
 ---
 
-## Step 7 — Update the Cowork Artifact
+## Step 7 — Sync to Supabase
+
+After the dashboard HTML is updated, upsert all scraped reels into the Supabase `reels` table.
+
+**Project ID**: `byxiutawntkirnwtbpju`  
+**Table**: `reels`
+
+Use `mcp__supabase__execute_sql` with an UPSERT. Build one query covering all reels:
+
+```sql
+INSERT INTO reels (id, url, title, views, reached, likes, comments, saves, shares, engaged,
+                   follower_pct, category, no_view_data, hook, tactics, growth, updated_at)
+VALUES
+  ({id}, '{url}', '{title}', {views}, {reached}, {likes}, {comments}, {saves}, {shares},
+   {engaged}, {follower_pct_or_NULL}, '{category}', {true|false}, '{hook}', '{tactics}', '{growth}', now()),
+  -- repeat for each reel
+ON CONFLICT (id) DO UPDATE SET
+  views        = EXCLUDED.views,
+  reached      = EXCLUDED.reached,
+  likes        = EXCLUDED.likes,
+  comments     = EXCLUDED.comments,
+  saves        = EXCLUDED.saves,
+  shares       = EXCLUDED.shares,
+  engaged      = EXCLUDED.engaged,
+  follower_pct = EXCLUDED.follower_pct,
+  updated_at   = now();
+  -- NOTE: hook/tactics/growth are NOT updated on conflict — preserve existing analysis
+```
+
+**SQL escaping rules:**
+- Escape single quotes in all text fields by doubling them: `it's` → `it''s`
+- Use `NULL` (unquoted) for null follower_pct values
+- Use `true`/`false` (unquoted) for no_view_data boolean
+
+**After upserting, verify with:**
+```sql
+SELECT COUNT(*) as total_reels,
+       SUM(views) as total_views,
+       SUM(reached) as total_reach,
+       ROUND(SUM(likes + comments + shares + saves)::numeric / NULLIF(SUM(reached), 0) * 100, 2) as ir_pct,
+       ROUND(SUM(saves)::numeric / NULLIF(SUM(reached), 0) * 100, 2) as save_rate_pct
+FROM reels;
+```
+
+---
+
+## Step 8 — Update the Cowork Artifact
 
 After saving the HTML file, update the Cowork artifact:
 ```
@@ -241,24 +292,24 @@ mcp__cowork__update_artifact:
 
 ---
 
-## Step 8 — Push to GitHub
+## Step 9 — Push to GitHub
 
 Push the updated `soccer-analytica.html` to the `soccer-analytica` GitHub repo as `index.html`:
 
 ```
 mcp__github__create_or_update_file:
-  owner: {github_username}   // find via mcp__github__search_users or from known username
+  owner: saksenaapurva
   repo: "soccer-analytica"
   path: "index.html"
   message: "Monthly audit — {current_date}: {reel_count} reels, {new_reels} new"
   content: {base64_encoded_html_content}
-  sha: {current_file_sha}   // get this first via mcp__github__get_file_contents
+  sha: {current_file_sha}
 ```
 
 To get the current SHA before overwriting:
 ```
 mcp__github__get_file_contents:
-  owner: {username}
+  owner: saksenaapurva
   repo: "soccer-analytica"
   path: "index.html"
 ```
@@ -266,7 +317,7 @@ Extract the `sha` field from the response, then pass it to `create_or_update_fil
 
 ---
 
-## Step 9 — Summary Report
+## Step 10 — Summary Report
 
 After completing everything, output a brief summary:
 
@@ -274,14 +325,15 @@ After completing everything, output a brief summary:
 ✅ Monthly audit complete — {date}
 
 📊 Reels scraped: {total} ({new_count} new)
-👁️ Total views: {total_views}
+👁️  Total views: {total_views}
 📡 Total reach: {total_reach}
 📈 Interaction Rate: {ir}% (benchmark: 3.5%)
 🔖 Save Rate: {save_rate}% (target: >2%)
 
 New reels found: {list of new shortcodes + titles}
-Dashboard updated: [Cowork artifact + GitHub Pages]
-GitHub URL: https://{username}.github.io/soccer-analytica/
+Database:  Supabase reels table synced ✅
+Dashboard: Cowork artifact updated ✅
+GitHub:    https://saksenaapurva.github.io/soccer-analytica/ updated ✅
 ```
 
 ---
@@ -294,6 +346,7 @@ GitHub URL: https://{username}.github.io/soccer-analytica/
 | Reel shows `--` for views | Set `noViewData: true`, set views/reached to 0, keep other metrics |
 | get_page_text returns empty | Wait 3s and retry once. If still empty, skip reel and note it. |
 | GitHub SHA mismatch | Re-fetch the file's SHA and retry |
+| Supabase upsert fails | Check for unescaped single quotes — double all apostrophes in text fields |
 | New reel count > 5 | Still process all — just takes longer |
 
 ---
@@ -301,7 +354,7 @@ GitHub URL: https://{username}.github.io/soccer-analytica/
 ## Data Schema Reference
 
 ```javascript
-// Full SCRAPED entry schema
+// Full SCRAPED entry schema (dashboard JS)
 {
   id: Number,           // sequential, 1-based, don't change for existing reels
   url: String,          // Instagram shortcode (e.g., "DXuxvGHEraO")
@@ -322,13 +375,39 @@ GitHub URL: https://{username}.github.io/soccer-analytica/
 }
 ```
 
+```sql
+-- Supabase reels table columns
+id               integer PRIMARY KEY
+url              text             -- Instagram shortcode
+title            text
+views            integer
+reached          integer
+likes            integer
+comments         integer
+saves            integer
+shares           integer
+engaged          integer
+follower_pct     numeric(5,2)     -- nullable
+category         text
+no_view_data     boolean
+hook             text
+tactics          text
+growth           text
+interaction_rate numeric(6,4)     -- auto-calculated: (likes+comments+shares+saves)/reached*100
+save_rate        numeric(6,4)     -- auto-calculated: saves/reached*100
+scraped_at       timestamptz      -- first insert time
+updated_at       timestamptz      -- updated each audit run
+```
+
 ---
 
 ## Niche Context (for writing new reel analysis)
 
-@soccer_analytica is a **football analytics / curiosity explainer** channel:
+@soccer_analytica is a **football animation / mystery explainer** channel:
+- Visual style: cartoon animated players, bold italic yellow-outlined text (YouTube thumbnail style)
 - Best content formula: [Surprising football event] + [data that explains why] + [curiosity hook title]
 - Top content pillars: UCL/trending moments, historical drama, cross-club EPL coverage, tactical analysis
 - Audience rewards: questions not statements, "why did this happen?" format, animated visual style
-- Algorithm weaknesses to address: saves (0.09% rate, need 2%+), comments (near zero), posting consistency
+- Algorithm weaknesses to address: saves (low rate, need 2%+), comments (near zero), posting consistency
 - Benchmarks: IR target 3.5%, save rate target 2%, nano-creator engagement should be 5-10%
+- Tagline: "The Data Behind The Drama"
